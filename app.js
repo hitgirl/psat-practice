@@ -3,6 +3,8 @@
 //   #/                       home (exams grouped by subject, with final scores)
 //   #/s/<sec>/e/<exam>/q/<n>  question n (1-based) of a module
 //   #/s/<sec>/e/<exam>/results
+//   #/report                 progress report for tutors (report.js)
+//   #/shared/<data>          a report shared as a link (read-only)
 //
 // <sec> indexes PSAT_DATA (one entry per subject module). The answer key lives
 // in key.js and is only decoded to score a finished module; it is never shown
@@ -39,9 +41,74 @@ function save() {
 
 function examState(s, e) {
   const key = `${s}-${e}`;
-  if (!progress[key]) progress[key] = { answers: {}, skipped: {}, finished: false };
+  if (!progress[key]) progress[key] = { answers: {}, skipped: {}, time: {}, finished: false };
   return progress[key];
 }
+
+// ---------- attempt history (kept across retakes, used by the report) ----------
+// Each finished module becomes one attempt: { s, e, startedAt, finishedAt, answers, time }.
+const HISTORY_KEY = "psat-history-v1";
+let history = [];
+try { history = JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch { history = []; }
+
+function saveHistory() {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+}
+
+function recordAttempt(s, e) {
+  const st = examState(s, e);
+  history.push({
+    s, e,
+    startedAt: st.startedAt || null,
+    finishedAt: st.finishedAt || null,
+    answers: { ...st.answers },
+    time: { ...(st.time || {}) },
+  });
+  st.logged = true;
+  saveHistory();
+  save();
+}
+
+// Modules finished before history tracking existed get logged once.
+for (const [k, st] of Object.entries(progress)) {
+  if (st.finished && !st.logged) {
+    const [s, e] = k.split("-").map(Number);
+    recordAttempt(s, e);
+  }
+}
+
+// ---------- time per question ----------
+// Counts time while a question is on screen and the tab is visible.
+// A single visit is capped at 30 minutes so a forgotten open tab doesn't skew it.
+let timer = null;
+let pausedTimer = null;
+
+function startTimer(s, e, qid) {
+  stopTimer();
+  timer = { s, e, qid, t: Date.now() };
+}
+
+function stopTimer() {
+  if (!timer) return;
+  const st = progress[`${timer.s}-${timer.e}`];
+  if (st && !st.finished) {
+    const secs = Math.min((Date.now() - timer.t) / 1000, 1800);
+    st.time = st.time || {};
+    st.time[timer.qid] = Math.round((st.time[timer.qid] || 0) + secs);
+    save();
+  }
+  timer = null;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    pausedTimer = timer && { ...timer };
+    stopTimer();
+  } else if (pausedTimer) {
+    startTimer(pausedTimer.s, pausedTimer.e, pausedTimer.qid);
+    pausedTimer = null;
+  }
+});
 
 function isFinished(s, e) {
   const st = progress[`${s}-${e}`];
@@ -151,6 +218,8 @@ function renderQuestion(s, e, n) {
   const selected = st.answers[q.id];
   const isLast = n === qs.length;
   document.title = `Q${n} · Exam ${e + 1} · PSAT 8/9`;
+  if (!st.startedAt) { st.startedAt = Date.now(); save(); }
+  startTimer(s, e, q.id);
 
   const nav = qs.map((qq, k) => {
     const cls = [
@@ -189,8 +258,10 @@ function renderQuestion(s, e, n) {
     const open = qs.filter(qq => !st.answers[qq.id]).length;
     if (open && !confirm(`You have ${open} unanswered question${open > 1 ? "s" : ""}. ` +
       `Unanswered questions are scored as incorrect.\n\nFinish this module?`)) return false;
+    stopTimer();
     st.finished = true;
-    save();
+    st.finishedAt = Date.now();
+    recordAttempt(s, e);
     go(`${examPath(s, e)}/results`);
     return true;
   };
@@ -265,7 +336,7 @@ function renderResults(s, e) {
   `;
 
   document.getElementById("reset").addEventListener("click", () => {
-    if (!confirm("Clear your answers for this module and start over?")) return;
+    if (!confirm("Start this module over? This attempt stays in the progress report.")) return;
     delete progress[`${s}-${e}`];
     save();
     go(`${examPath(s, e)}/q/1`);
@@ -274,6 +345,9 @@ function renderResults(s, e) {
 
 // ---------- router ----------
 function route() {
+  stopTimer();
+  if (location.hash === "#/report") return renderReport();
+  if (location.hash.startsWith("#/shared/")) return renderSharedReport(location.hash.slice(9));
   const m = location.hash.match(/^#\/s\/(\d+)\/e\/(\d+)\/(?:q\/(\d+)|(results))$/);
   if (m) {
     const s = +m[1], e = +m[2];
