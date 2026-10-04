@@ -216,3 +216,8 @@ table.data tr:last-child td { border-bottom: none; }
   .card, .stat, table.data { break-inside: avoid; }
   table.data th, table.data td { white-space: normal; }
 }
+
+/* Online saving */
+.onlineOn { border-color: var(--good); }
+.bad { color: var(--bad); }
+.filters { margin: 20px 0 4px; }

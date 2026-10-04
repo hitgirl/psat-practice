@@ -5,6 +5,8 @@
 //   #/s/<sec>/e/<exam>/results
 //   #/report                 progress report for tutors (report.js)
 //   #/shared/<data>          a report shared as a link (read-only)
+//   #/tutor/<code>           live page of wrong/skipped questions, from the database (sync.js)
+//   #/connect/<code>         connects this device to a student's online results (sync.js)
 //
 // <sec> indexes PSAT_DATA (one entry per subject module). The answer key lives
 // in key.js and is only decoded to score a finished module; it is never shown
@@ -46,7 +48,8 @@ function examState(s, e) {
 }
 
 // ---------- attempt history (kept across retakes, used by the report) ----------
-// Each finished module becomes one attempt: { s, e, startedAt, finishedAt, answers, time }.
+// Each finished module becomes one attempt: { id, s, e, startedAt, finishedAt, answers, time, synced }.
+// Attempts are also saved online when this device is connected (sync.js).
 const HISTORY_KEY = "psat-history-v1";
 let history = [];
 try { history = JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch { history = []; }
@@ -55,9 +58,24 @@ function saveHistory() {
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
 }
 
+function newId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+// Attempts recorded before online saving existed need an id to sync.
+if (history.some(a => !a.id)) {
+  history.forEach(a => { if (!a.id) a.id = newId(); });
+  saveHistory();
+}
+
 function recordAttempt(s, e) {
   const st = examState(s, e);
   history.push({
+    id: newId(),
     s, e,
     startedAt: st.startedAt || null,
     finishedAt: st.finishedAt || null,
@@ -67,6 +85,7 @@ function recordAttempt(s, e) {
   st.logged = true;
   saveHistory();
   save();
+  syncAttempts();
 }
 
 // Modules finished before history tracking existed get logged once.
@@ -137,13 +156,18 @@ function esc(str) {
   return str.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Question text may underline the tested words with <u>…</u>; everything else is escaped.
+function richText(str) {
+  return esc(str).replace(/&lt;(\/?)u&gt;/g, "<$1u>");
+}
+
 // Prompts use "\n" for line breaks and "a | b | c" lines for tables.
 function renderPrompt(text) {
   let html = "";
   let table = [];
   const flush = () => {
     if (!table.length) return;
-    html += "<table>" + table.map(r => "<tr>" + r.map(c => `<td>${esc(c.trim())}</td>`).join("") + "</tr>").join("") + "</table>";
+    html += "<table>" + table.map(r => "<tr>" + r.map(c => `<td>${richText(c.trim())}</td>`).join("") + "</tr>").join("") + "</table>";
     table = [];
   };
   for (const line of text.split("\n")) {
@@ -151,7 +175,7 @@ function renderPrompt(text) {
       table.push(line.split(" | "));
     } else {
       flush();
-      if (line.trim()) html += `<p>${esc(line)}</p>`;
+      if (line.trim()) html += `<p>${richText(line)}</p>`;
     }
   }
   flush();
@@ -240,7 +264,7 @@ function renderQuestion(s, e, n) {
       <div class="prompt">${renderPrompt(q.prompt)}</div>
       <ul class="choices">
         ${LETTERS.map(L => `<li><button class="choice ${selected === L ? "selected" : ""}" data-choice="${L}">
-          <span class="letter">${L}</span><span>${esc(q.choices[L])}</span></button></li>`).join("")}
+          <span class="letter">${L}</span><span>${richText(q.choices[L])}</span></button></li>`).join("")}
       </ul>
       <div class="actions">
         <button class="btn" id="back" ${n === 1 ? "disabled" : ""}>Back</button>
@@ -308,8 +332,8 @@ function renderResults(s, e) {
     return `<div class="card">
       <div class="qHeader"><strong>Question ${k + 1}</strong>${tag}</div>
       <div class="prompt">${renderPrompt(q.prompt)}</div>
-      <div>Your answer: <strong>${mine ? `${mine}. ${esc(q.choices[mine])}` : "—"}</strong></div>
-      <div>Correct answer: <strong>${correct}. ${esc(q.choices[correct])}</strong></div>
+      <div>Your answer: <strong>${mine ? `${mine}. ${richText(q.choices[mine])}` : "—"}</strong></div>
+      <div>Correct answer: <strong>${correct}. ${richText(q.choices[correct])}</strong></div>
       <div class="explain">${esc(explanation)}</div>
     </div>`;
   }).join("");
@@ -348,6 +372,8 @@ function route() {
   stopTimer();
   if (location.hash === "#/report") return renderReport();
   if (location.hash.startsWith("#/shared/")) return renderSharedReport(location.hash.slice(9));
+  if (location.hash.startsWith("#/tutor/")) return renderTutor(location.hash.slice(8));
+  if (location.hash.startsWith("#/connect/")) return connectDevice(location.hash.slice(10));
   const m = location.hash.match(/^#\/s\/(\d+)\/e\/(\d+)\/(?:q\/(\d+)|(results))$/);
   if (m) {
     const s = +m[1], e = +m[2];
@@ -379,3 +405,4 @@ document.addEventListener("keydown", ev => {
 });
 
 route();
+syncAttempts();

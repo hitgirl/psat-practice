@@ -118,31 +118,34 @@ function download(filename, text, type) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// ---------- report view ----------
-function reportBody(attempts) {
-  if (!attempts.length) {
-    return `<div class="card"><p class="muted" style="margin:0">No finished modules yet. Scores and mistakes show up here after a module is finished.</p></div>`;
-  }
-  const key = answerKey();
-  const latest = latestAttempts(attempts);
-  const latestList = Object.values(latest);
+// ---------- report sections (shared by the report, snapshot and tutor pages) ----------
+function noAttemptsHTML() {
+  return `<div class="card"><p class="muted" style="margin:0">No finished modules yet. Scores and mistakes show up here after a module is finished.</p></div>`;
+}
 
-  // Overall numbers, from the latest attempt of each module.
+function missedQuestions(a) {
+  const key = answerKey();
+  return DATA[a.s].exams[a.e].map((q, i) => ({ q, i })).filter(({ q }) => a.answers[q.id] !== key[q.id][0]);
+}
+
+// Overall numbers, from the latest attempt of each module.
+function statsHTML(latestList) {
   const totals = latestList.map(scoreAttempt).reduce((t, x) =>
-    ({ correct: t.correct + x.correct, total: t.total + x.total, secs: t.secs + x.secs }), { correct: 0, total: 0, secs: 0 });
+    ({ correct: t.correct + x.correct, total: t.total + x.total }), { correct: 0, total: 0 });
   const unanswered = latestList.reduce((t, a) =>
     t + DATA[a.s].exams[a.e].filter(q => !a.answers[q.id]).length, 0);
-
-  let html = `<div class="statRow">
+  return `<div class="statRow">
     <div class="stat"><div class="statNum">${latestList.length}</div><div class="muted">modules finished</div></div>
     <div class="stat"><div class="statNum">${Math.round((totals.correct / totals.total) * 100)}%</div><div class="muted">${totals.correct}/${totals.total} correct</div></div>
     <div class="stat"><div class="statNum">${totals.total - totals.correct - unanswered}</div><div class="muted">incorrect</div></div>
-    <div class="stat"><div class="statNum">${unanswered}</div><div class="muted">unanswered</div></div>
+    <div class="stat"><div class="statNum">${unanswered}</div><div class="muted">skipped</div></div>
   </div>
   <p class="muted small">Scores and mistakes use the most recent attempt of each module. Earlier attempts are listed under “All attempts”.</p>`;
+}
 
-  // Scores table per subject.
-  html += `<h2>Scores</h2>`;
+// Scores table per subject.
+function scoresHTML(latest) {
+  let html = `<h2>Scores</h2>`;
   SUBJECTS.forEach(sub => {
     const exams = [...Array(12).keys()].filter(e => sub.mods.some(s => latest[`${s}-${e}`]));
     if (!exams.length) return;
@@ -158,17 +161,20 @@ function reportBody(attempts) {
     });
     html += `</table></div>`;
   });
+  return html;
+}
 
-  // Every mistake, grouped by module.
-  html += `<h2>Mistakes to review</h2>`;
+// Every wrong or skipped question, grouped by module.
+// filter: "all" | "wrong" | "skipped"
+function mistakesHTML(latestList, filter = "all") {
+  const key = answerKey();
   const ordered = latestList.slice().sort((a, b) =>
     SUBJECTS.indexOf(subjectOf(a.s)) - SUBJECTS.indexOf(subjectOf(b.s)) || a.e - b.e || a.s - b.s);
-  let anyMistakes = false;
+  let html = "";
   ordered.forEach(a => {
-    const qs = DATA[a.s].exams[a.e];
-    const missed = qs.map((q, i) => ({ q, i })).filter(({ q }) => a.answers[q.id] !== key[q.id][0]);
+    const missed = missedQuestions(a).filter(({ q }) =>
+      filter === "all" || (filter === "skipped") === !a.answers[q.id]);
     if (!missed.length) return;
-    anyMistakes = true;
     const sc = scoreAttempt(a);
     html += `<h3>${esc(attemptLabel(a))} <span class="muted small">· ${sc.correct}/${sc.total}${a.finishedAt ? ` · ${fmtDate(a.finishedAt)}` : ""}</span></h3>
       <div class="review">`;
@@ -177,28 +183,37 @@ function reportBody(attempts) {
       const [correct, explanation] = key[q.id];
       html += `<div class="card mistake">
         <div class="qHeader"><strong>Question ${i + 1}</strong>
-          <span>${mine ? `<span class="tag wrong">Incorrect</span>` : `<span class="tag skip">Unanswered</span>`}
+          <span>${mine ? `<span class="tag wrong">Incorrect</span>` : `<span class="tag skip">Skipped</span>`}
           <span class="muted small">${fmtSecs(a.time[q.id])}</span></span></div>
         <div class="prompt">${renderPrompt(q.prompt)}</div>
-        <div>Student's answer: <strong>${mine ? `${mine}. ${esc(q.choices[mine])}` : "—"}</strong></div>
-        <div>Correct answer: <strong>${correct}. ${esc(q.choices[correct])}</strong></div>
+        <div>Student's answer: <strong>${mine ? `${mine}. ${richText(q.choices[mine])}` : "— (skipped)"}</strong></div>
+        <div>Correct answer: <strong>${correct}. ${richText(q.choices[correct])}</strong></div>
         <div class="explain">${esc(explanation)}</div>
       </div>`;
     });
     html += `</div>`;
   });
-  if (!anyMistakes) html += `<p class="muted">No mistakes on the latest attempts.</p>`;
+  return html || `<p class="muted">Nothing to review here on the latest attempts.</p>`;
+}
 
-  // Full history, newest first.
-  html += `<h2>All attempts</h2><div class="tableWrap"><table class="data">
+// Full history, newest first.
+function attemptsHTML(attempts) {
+  let html = `<h2>All attempts</h2><div class="tableWrap"><table class="data">
     <tr><th>Finished</th><th>Module</th><th>Score</th><th>Time</th></tr>`;
   attempts.slice().reverse().forEach(a => {
     const sc = scoreAttempt(a);
     html += `<tr><td>${fmtDate(a.finishedAt)}</td><td>${esc(attemptLabel(a))}</td>
       <td>${sc.correct}/${sc.total} · ${pct(sc)}%</td><td>${fmtSecs(sc.secs)}</td></tr>`;
   });
-  html += `</table></div>`;
-  return html;
+  return html + `</table></div>`;
+}
+
+function reportBody(attempts) {
+  if (!attempts.length) return noAttemptsHTML();
+  const latest = latestAttempts(attempts);
+  const latestList = Object.values(latest);
+  return statsHTML(latestList) + scoresHTML(latest) +
+    `<h2>Mistakes to review</h2>` + mistakesHTML(latestList) + attemptsHTML(attempts);
 }
 
 function renderReport() {
@@ -211,12 +226,13 @@ function renderReport() {
       <label class="label" for="studentName">Student name (shown on the report)</label>
       <input id="studentName" class="input" value="${esc(name)}" placeholder="e.g. Alex" />
       <div class="row">
-        <button class="btn primary" id="share">Copy link for tutors</button>
+        <button class="btn" id="share">Copy snapshot link</button>
         <button class="btn" id="csv">Download spreadsheet (CSV)</button>
         <button class="btn" id="print">Print / Save as PDF</button>
       </div>
-      <p class="muted small" id="shareNote">The link is a snapshot of the report as of now. Send a new link after more practice.</p>
+      <p class="muted small" id="shareNote">A snapshot link shows the report as of now and works without online saving.</p>
     </div>
+    <div id="onlineCard" class="noPrint"></div>
     <p class="printOnly"><strong>Student:</strong> ${esc(name || "—")}</p>
     ${reportBody(history)}
   `;
@@ -247,6 +263,7 @@ function renderReport() {
   });
 
   document.getElementById("print").addEventListener("click", () => window.print());
+  renderOnlineCard();
 }
 
 async function renderSharedReport(code) {
