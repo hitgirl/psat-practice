@@ -45,8 +45,11 @@ async function rpc(fn, body) {
 let syncing = null;
 let lastSyncError = "";
 
-// Uploads every attempt not yet saved online. Safe to call often: attempts
-// have permanent ids, so a retry never creates duplicates.
+// Uploads every attempt not yet saved online, then downloads attempts made on
+// his other devices so every device shows the same scores and history. Safe to
+// call often: attempts have permanent ids, so nothing is ever duplicated.
+let lastPull = 0;
+
 function syncAttempts() {
   if (!syncConfigured() || !syncToken()) return Promise.resolve();
   if (syncing) return syncing;
@@ -61,6 +64,7 @@ function syncAttempts() {
         a.synced = true;
         saveHistory();
       }
+      await pullAttempts();
       lastSyncError = "";
     } catch (err) {
       lastSyncError = navigator.onLine === false ? "This device is offline." : String(err.message || err);
@@ -72,7 +76,55 @@ function syncAttempts() {
   return syncing;
 }
 
+// Adds attempts from other devices to this device's history, and marks those
+// modules finished here (unless he is partway through one on this device).
+async function pullAttempts() {
+  const rows = await rpc("get_attempts", { p_token: syncToken() });
+  lastPull = Date.now();
+  const known = new Set(history.map(a => a.id));
+  let changed = false;
+
+  for (const r of rows) {
+    if (known.has(r.id) || !DATA[r.section] || !DATA[r.section].exams[r.exam]) continue;
+    history.push({
+      id: r.id, s: r.section, e: r.exam,
+      startedAt: r.started_at ? Date.parse(r.started_at) : null,
+      finishedAt: r.finished_at ? Date.parse(r.finished_at) : null,
+      answers: r.answers || {}, time: r.seconds || {}, synced: true,
+    });
+    changed = true;
+  }
+  if (!studentName()) {
+    const name = [...rows].reverse().map(r => r.student_name).find(Boolean);
+    if (name) { try { localStorage.setItem(NAME_KEY, name); } catch {} }
+  }
+  if (!changed) return;
+
+  history.sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0));
+  saveHistory();
+
+  for (const [k, a] of Object.entries(latestAttempts(history))) {
+    const st = progress[k];
+    const midModule = st && !st.finished &&
+      (Object.keys(st.answers || {}).length || Object.keys(st.skipped || {}).length);
+    const newer = !st || !st.finished || (st.finishedAt || 0) < (a.finishedAt || 0);
+    if (newer && !midModule) {
+      progress[k] = {
+        answers: { ...a.answers }, skipped: {}, time: { ...a.time },
+        startedAt: a.startedAt, finishedAt: a.finishedAt, finished: true, logged: true,
+      };
+    }
+  }
+  save();
+  // Refresh the page he's looking at, unless he's answering a question.
+  if (!/\/q\/\d+$/.test(location.hash)) route();
+}
+
 window.addEventListener("online", () => syncAttempts());
+// Coming back to a tab left open for days: pick up results from other devices.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && Date.now() - lastPull > 60000) syncAttempts();
+});
 
 // ---------- report page: online saving controls ----------
 function renderOnlineCard() {
@@ -84,11 +136,30 @@ function renderOnlineCard() {
   if (!token) {
     box.innerHTML = `<div class="card" style="margin-top:12px">
       <strong>Online saving is off on this device</strong>
-      <p class="muted small">Turn it on here, on the device he practices on. Every finished module is then saved
-      online, and you get a link for tutors that always shows his latest wrong and skipped questions.</p>
-      <div class="row"><button class="btn primary" id="syncOn">Turn on online saving</button></div>
+      <p class="muted small">Once it's on, every finished module is saved online, every connected device shows
+      the same results, and tutors get a link that always shows his latest wrong and skipped questions.</p>
+      <p class="small" style="margin-bottom:6px"><strong>Already set up on another device?</strong>
+      Paste the connect link from that device's Progress report here:</p>
+      <div class="row" style="margin-top:0">
+        <input id="connectInput" class="input" placeholder="https://…#/connect/…" />
+        <button class="btn primary" id="connectBtn">Connect this device</button>
+      </div>
+      <p class="small" style="margin:16px 0 6px"><strong>Setting up for the first time?</strong> Do this once, on one device:</p>
+      <button class="btn" id="syncOn">Set up online saving</button>
+      <p class="muted small" id="connectNote"></p>
     </div>`;
+    document.getElementById("connectBtn").addEventListener("click", () => {
+      const m = document.getElementById("connectInput").value.trim().match(/#\/connect\/([A-Za-z0-9_-]{20,})/);
+      if (!m) {
+        document.getElementById("connectNote").textContent =
+          "That doesn't look like a connect link. On the other device, open Progress report and click “Copy link to connect another device”.";
+        return;
+      }
+      connectDevice(m[1]);
+    });
     document.getElementById("syncOn").addEventListener("click", async () => {
+      if (!confirm("Is this the first device you're setting up?\n\nIf online saving is already on for another device, " +
+        "click Cancel and use that device's connect link instead, so all his results stay together.")) return;
       if (!studentName() && !confirm("Add his name above first so tutors see it? Click Cancel to add it, OK to continue without.")) return;
       setSyncToken(newSyncToken());
       renderOnlineCard();
@@ -138,8 +209,8 @@ function connectDevice(token) {
     return go("#/report");
   }
   setSyncToken(token);
+  if (location.hash === "#/report") renderReport(); else go("#/report");
   syncAttempts();
-  go("#/report");
 }
 
 // ---------- #/tutor/<code> ----------
